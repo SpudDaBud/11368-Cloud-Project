@@ -1,0 +1,34 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: > #description that labels all of the services that are being deployed in this template
+  AWS CloudFormation Template for Regional Sports Portal.
+  Deploys a 2-AZ VPC, Public ALB, Private ASG (EC2), Private RDS, 
+  S3 Buckets, SQS Queue, Lambda Image Resizer, Secrets Manager, and CloudWatch Dashboard/Alarm.
+
+Parameters:
+  VpcCidr:
+    Type: String
+    Default: '10.0.0.0/16'
+    Description: CIDR block for the custom Virtual Private Cloud (VPC).
+
+  DatabaseName:
+    Type: String
+    Default: 'sportsportal'
+    Description: Initial relational database name for member and booking records.
+
+  DBMasterUsername:
+    Type: String
+    Default: 'portaladmin'
+    Description: Master administrative username for the RDS PostgreSQL database.
+
+  LabRoleArn:
+    Type: String
+    Default: 'arn:aws:iam::123456789012:role/LabRole' # This uses the Lab Role that we were given for the project
+    Description: >
+      Pre-existing AWS Learner Lab IAM Role ARN. Required because 
+      IAM role creation is restricted in Learner Lab environments.
+
+  LabInstanceProfileName:
+    Type: String
+    Default: 'LabInstanceProfile' #This is more given context
+    Description: Pre-existing Learner Lab Instance Profile attached to EC2 instances.
+
