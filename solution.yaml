@@ -33,7 +33,9 @@ Parameters:
     Description: Pre-existing Learner Lab Instance Profile attached to EC2 instances.
 
 
-Resources: #Part One, Containing the VPC, Subnets, gateways and route tables
+#----------------------------------------------------------------------#
+#Part One, Containing the VPC, Subnets, gateways and route tables
+Resources:
   # VPC
   SportsPortalVPC:
     Type: AWS::EC2::VPC
@@ -193,4 +195,174 @@ Resources: #Part One, Containing the VPC, Subnets, gateways and route tables
     Properties:
       SubnetId: !Ref PrivateSubnet2
       RouteTableId: !Ref PrivateRouteTable
+  
+
+
+#-----------------------------------------------------------------------#
+#Part Two, Security Groups for the ALB, EC2 instances, and RDS database
+  ALBSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: Security group for the Application Load Balancer (ALB)
+        VpcId: !Ref SportsPortalVPC
+        SecurityGroupIngress:
+          - IpProtocol: tcp
+            FromPort: 80
+            ToPort: 80
+            CidrIp: '0.0.0.0/0'
+  
+  EC2SecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: Security group for the EC2 instances in the Auto Scaling Group (ASG)
+        VpcId: !Ref SportsPortalVPC
+        SecurityGroupIngress:
+          - IpProtocol: tcp
+            FromPort: 80
+            ToPort: 80
+            SourceSecurityGroupId: !Ref ALBSecurityGroup
+  
+  DBSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: Security group for the RDS PostgreSQL database
+        VpcId: !Ref SportsPortalVPC
+        SecurityGroupIngress:
+          - IpProtocol: tcp
+            FromPort: 5432
+            ToPort: 5432
+            SourceSecurityGroupId: !Ref EC2SecurityGroup
+
+
+#-----------------------------------------------------------------------#
+#Part Three, Secrets Manager for generating and storing the DB password
+  DBSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: SportsPortalDBSecret
+      Description: Secret for RDS PostgreSQL database credentials
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username": "${DBMasterUsername}"}'
+        GenerateStringKey: "password"
+        PasswordLength: 16
+        ExcludePunctuation: true
+
+
+#-----------------------------------------------------------------------#
+#Part Four, Data base 
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for RDS PostgreSQL database
+      SubnetIds:
+        - !Ref PrivateDBSubnet1
+        - !Ref PrivateDBSubnet2
+      Tags:
+        - Key: Name
+          Value: SportsPortalDBSubnetGroup
+
+
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: postgres
+      EngineVersion: "15"
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: 20
+      DBName: !Ref DatabaseName
+      MasterUsername: !Ref DBMasterUsername
+      MasterUserPassword: !Join
+        - ''
+        - - '{{resolve:secretsmanager:'
+          - !Ref DBSecret
+          - ':SecretString:password}}'
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DBSecurityGroup
+      MultiAZ: false #learner lab does not support multi-AZ deployments, so this is set to false
+      PubliclyAccessible: false #Not accessible from the internet, only from the VPC
+      BackupRetentionPeriod: 2556  #snap shots from the DB for retention for 7 years
+      DeletionProtection: false #Allows the DB to be deleted when the stack is deleted
+
+#-----------------------------------------------------------------------#
+#Part Five, S3 Buckets for raw photo uploads and expire after 6 months
+  RawPhotoBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'sportsportal-raw-photos-${AWS::AccountId}-${AWS::Region}'
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireRawPhotos
+            Status: Enabled
+            ExpirationInDays: 7 #expire after 1 Week
+
+  #s3 bucket for resized images
+  ResizedPhotoBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'sportsportal-resized-photos-${AWS::AccountId}-${AWS::Region}'
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireRawPhotos
+            Status: Enabled
+            ExpirationInDays: 180 #expire after 6 months
+  
+  PhotoProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'sportsportal-photo-processing-queue-${AWS::AccountId}-${AWS::Region}'
+      VisibilityTimeout: 60 #seconds, time for the Lambda to process the message before it becomes visible again
+      RedrivePolicy: !Sub
+        deadLetterTargetArn": "${PhotoProcessingDeadLetterQueue.Arn}"
+        maxReceiveCount": 3
+
+  PhotoProcessingDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'sportsportal-photo-processing-dead-letter-queue-${AWS::AccountId}-${AWS::Region}'
+  
+  RawPhotoBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref RawPhotoBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: !Sub '${RawPhotoBucket.Arn}/*'
+
+  #Lambda function to resize images asynchronously when they are uploaded to the raw photo bucket
+  ImageResizerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'sportsportal-image-resizer-${AWS::AccountId}-${AWS::Region}'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LabRoleArn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          RESIZED_BUCKET: !Ref ResizedPhotoBucket
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+            console.log("Processing SQS photo resize event asynchronously:", JSON.stringify(event, null, 2));
+            // Asynchronous resize logic simulation
+            return { statusCode: 200, body: "Image resized and stored successfully" };
+          };
+
+  #connects the SQS queue to the Lambda function so that when a message is sent to the queue, the Lambda function is triggered
+  LambdaEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      EventSourceArn: !GetAtt PhotoProcessingQueue.Arn
+      FunctionName: !GetAtt ImageResizerLambda.Arn
+      Enabled: true
+
+#-----------------------------------------------------------------------#
+# Application Load Balancer (ALB) and Auto Scaling Group (ASG) for the EC2 instances
   
