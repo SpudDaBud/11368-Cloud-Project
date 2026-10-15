@@ -32,3 +32,52 @@ Parameters:
     Default: 'LabInstanceProfile' #This is more given context
     Description: Pre-existing Learner Lab Instance Profile attached to EC2 instances.
 
+
+Resources: #Part One, Containing the VPC, Subnets, gateways and route tables
+  # VPC
+  SportsPortalVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: SportsPortalVPC
+
+  # Internet Gateway
+  SportsPortalInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: SportsPortalInternetGateway
+  
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref SportsPortalVPC
+      InternetGatewayId: !Ref SportsPortalInternetGateway
+
+  # Public Subnets
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref SportsPortalVPC
+      CidrBlock: '10.0.1.0/24'
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: PublicSubnetAZ1
+  
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet 
+    Properties:
+        VpcId: !Ref SportsPortalVPC
+        CidrBlock: '10.0.2.0/24'
+        AvailabilityZone: !Select [ 1, !GetAZs '' ]
+        MapPublicIpOnLaunch: true
+        Tags:
+          - Key: Name
+            Value: PublicSubnetAZ2
