@@ -32,6 +32,11 @@ Parameters:
     Default: 'LabInstanceProfile' #This is more given context
     Description: Pre-existing Learner Lab Instance Profile attached to EC2 instances.
 
+  LatestAmazonLinux2AMI:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Description: Latest Amazon Linux 2 AMI ID for this region.
+
 
 #----------------------------------------------------------------------#
 #Part One, Containing the VPC, Subnets, gateways and route tables
@@ -291,11 +296,16 @@ Resources:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: !Sub 'sportsportal-raw-photos-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
       LifecycleConfiguration:
         Rules:
           - Id: ExpireRawPhotos
             Status: Enabled
-            ExpirationInDays: 7 #expire after 1 Week
+            ExpirationInDays: 7
 
   #s3 bucket for resized images
   ResizedPhotoBucket:
@@ -313,25 +323,14 @@ Resources:
     Properties:
       QueueName: !Sub 'sportsportal-photo-processing-queue-${AWS::AccountId}-${AWS::Region}'
       VisibilityTimeout: 60 #seconds, time for the Lambda to process the message before it becomes visible again
-      RedrivePolicy: !Sub
-        deadLetterTargetArn": "${PhotoProcessingDeadLetterQueue.Arn}"
-        maxReceiveCount": 3
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt PhotoProcessingDeadLetterQueue.Arn
+        maxReceiveCount: 3
 
   PhotoProcessingDeadLetterQueue:
     Type: AWS::SQS::Queue
     Properties:
       QueueName: !Sub 'sportsportal-photo-processing-dead-letter-queue-${AWS::AccountId}-${AWS::Region}'
-  
-  RawPhotoBucketPolicy:
-    Type: AWS::S3::BucketPolicy
-    Properties:
-      Bucket: !Ref RawPhotoBucket
-      PolicyDocument:
-        Statement:
-          - Effect: Allow
-            Principal: '*'
-            Action: 's3:GetObject'
-            Resource: !Sub '${RawPhotoBucket.Arn}/*'
 
   #Lambda function to resize images asynchronously when they are uploaded to the raw photo bucket
   ImageResizerLambda:
@@ -340,7 +339,7 @@ Resources:
       FunctionName: !Sub 'sportsportal-image-resizer-${AWS::AccountId}-${AWS::Region}'
       Runtime: nodejs18.x
       Handler: index.handler
-      Role: !GetAtt LabRoleArn
+      Role: !Ref LabRoleArn
       Timeout: 30
       MemorySize: 256
       Environment:
@@ -368,7 +367,7 @@ Resources:
   ApplicationLoadBalancer:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
-      Name: !Sub 'sportsportal-alb-${AWS::AccountId}-${AWS::Region}'
+      Name: !Sub 'sp-alb-${AWS::AccountId}'
       Subnets:
         - !Ref PublicSubnet1
         - !Ref PublicSubnet2
@@ -378,7 +377,7 @@ Resources:
   ALBTargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
-      Name: !Sub 'sportsportal-alb-target-group-${AWS::AccountId}-${AWS::Region}'
+      Name: !Sub 'sp-tg-${AWS::AccountId}'
       Port: 80
       Protocol: HTTP
       VpcId: !Ref SportsPortalVPC
@@ -401,20 +400,20 @@ Resources:
     Type: AWS::EC2::LaunchTemplate
     Properties:
       LaunchTemplateData:
-      InstanceType: t3.micro
-      ImageId: !Ref LatestAmazonLinux2AMI
-      IamInstanceProfile:
-        Name: !Ref LabInstanceProfileName
-      SecurityGroupIds:
-        - !Ref EC2SecurityGroup
-      UserData:
-        Fn::Base64: !Sub |
-          #!/bin/bash
-          yum update -y
-          amazon-linux-extras install -y nginx1
-          systemctl enable nginx
-          systemctl start nginx
-          echo "<h1>Welcome to the Regional Sports Portal</h1>" > /usr/share/nginx/html/index.html
+        InstanceType: t3.micro
+        ImageId: !Ref LatestAmazonLinux2AMI
+        IamInstanceProfile:
+          Name: !Ref LabInstanceProfileName
+        SecurityGroupIds:
+          - !Ref EC2SecurityGroup
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            amazon-linux-extras install -y nginx1
+            systemctl enable nginx
+            systemctl start nginx
+            echo "<h1>Welcome to the Regional Sports Portal</h1>" > /usr/share/nginx/html/index.html
 
   AutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
@@ -510,15 +509,15 @@ Resources:
           ]
         }
 
-  Outputs:
-    PortalURL:
-      Description: "URL of the Regional Sports Portal"
-      Value: !Sub "http://${ApplicationLoadBalancer.DNSName}"
-    
-    RawPhotoBucketName:
-      Description: "Name of the S3 bucket for raw photo uploads"
-      Value: !Ref RawPhotoBucket
+Outputs:
+  PortalURL:
+    Description: "URL of the Regional Sports Portal"
+    Value: !Sub "http://${ApplicationLoadBalancer.DNSName}"
+  
+  RawPhotoBucketName:
+    Description: "Name of the S3 bucket for raw photo uploads"
+    Value: !Ref RawPhotoBucket
 
-    SecretName:
-      Description: "Name of the Secrets Manager secret for RDS credentials"
-      Value: !Ref DBSecret
+  SecretName:
+    Description: "Name of the Secrets Manager secret for RDS credentials"
+    Value: !Ref DBSecret
