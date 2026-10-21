@@ -1,8 +1,9 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: > #description that labels all of the services that are being deployed in this template
+Description: >
   AWS CloudFormation Template for Regional Sports Portal.
-  Deploys a 2-AZ VPC, Public ALB, Private ASG (EC2), Private RDS, 
+  Deploys a 2-AZ VPC, Public ALB, Private ASG (EC2), Private RDS,
   S3 Buckets, SQS Queue, Lambda Image Resizer, Secrets Manager, and CloudWatch Dashboard/Alarm.
+  Designed for the AWS Academy Learner Lab (uses LabRole / LabInstanceProfile).
 
 Parameters:
   VpcCidr:
@@ -20,16 +21,9 @@ Parameters:
     Default: 'portaladmin'
     Description: Master administrative username for the RDS PostgreSQL database.
 
-  LabRoleArn:
-    Type: String
-    Default: 'arn:aws:iam::123456789012:role/LabRole' # This uses the Lab Role that we were given for the project
-    Description: >
-      Pre-existing AWS Learner Lab IAM Role ARN. Required because 
-      IAM role creation is restricted in Learner Lab environments.
-
   LabInstanceProfileName:
     Type: String
-    Default: 'LabInstanceProfile' #This is more given context
+    Default: 'LabInstanceProfile'
     Description: Pre-existing Learner Lab Instance Profile attached to EC2 instances.
 
   LatestAmazonLinux2AMI:
@@ -39,9 +33,8 @@ Parameters:
 
 
 #----------------------------------------------------------------------#
-#Part One, Containing the VPC, Subnets, gateways and route tables
+# Part One: VPC, subnets, gateways and route tables
 Resources:
-  # VPC
   SportsPortalVPC:
     Type: AWS::EC2::VPC
     Properties:
@@ -52,21 +45,20 @@ Resources:
         - Key: Name
           Value: SportsPortalVPC
 
-  # Internet Gateway
   SportsPortalInternetGateway:
     Type: AWS::EC2::InternetGateway
     Properties:
       Tags:
         - Key: Name
           Value: SportsPortalInternetGateway
-  
+
   VPCGatewayAttachment:
     Type: AWS::EC2::VPCGatewayAttachment
     Properties:
       VpcId: !Ref SportsPortalVPC
       InternetGatewayId: !Ref SportsPortalInternetGateway
 
-  # Public Subnets
+  # Public subnets
   PublicSubnet1:
     Type: AWS::EC2::Subnet
     Properties:
@@ -77,19 +69,19 @@ Resources:
       Tags:
         - Key: Name
           Value: PublicSubnetAZ1
-  
-  PublicSubnet2:
-    Type: AWS::EC2::Subnet 
-    Properties:
-        VpcId: !Ref SportsPortalVPC
-        CidrBlock: '10.0.2.0/24'
-        AvailabilityZone: !Select [ 1, !GetAZs '' ]
-        MapPublicIpOnLaunch: true
-        Tags:
-          - Key: Name
-            Value: PublicSubnetAZ2
 
-  # Private Subnets
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref SportsPortalVPC
+      CidrBlock: '10.0.2.0/24'
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: PublicSubnetAZ2
+
+  # Private application subnets
   PrivateSubnet1:
     Type: AWS::EC2::Subnet
     Properties:
@@ -99,7 +91,7 @@ Resources:
       Tags:
         - Key: Name
           Value: PrivateSubnetAZ1
-  
+
   PrivateSubnet2:
     Type: AWS::EC2::Subnet
     Properties:
@@ -109,8 +101,8 @@ Resources:
       Tags:
         - Key: Name
           Value: PrivateSubnetAZ2
-  
-  #Priavte Database Subnets
+
+  # Private database subnets
   PrivateDBSubnet1:
     Type: AWS::EC2::Subnet
     Properties:
@@ -120,7 +112,7 @@ Resources:
       Tags:
         - Key: Name
           Value: PrivateDBSubnetAZ1
-  
+
   PrivateDBSubnet2:
     Type: AWS::EC2::Subnet
     Properties:
@@ -131,9 +123,10 @@ Resources:
         - Key: Name
           Value: PrivateDBSubnetAZ2
 
-  #Elastic IP and NAT for outbound traffic from private subnets
+  # Elastic IP and NAT gateway for outbound traffic from private subnets
   EIPNat:
     Type: AWS::EC2::EIP
+    DependsOn: VPCGatewayAttachment
     Properties:
       Domain: vpc
 
@@ -146,7 +139,7 @@ Resources:
         - Key: Name
           Value: NatGateway
 
-  # Route Tables
+  # Route tables
   PublicRouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
@@ -154,9 +147,10 @@ Resources:
       Tags:
         - Key: Name
           Value: PublicRouteTable
-  
+
   PublicRoute:
     Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
     Properties:
       RouteTableId: !Ref PublicRouteTable
       DestinationCidrBlock: '0.0.0.0/0'
@@ -167,7 +161,7 @@ Resources:
     Properties:
       SubnetId: !Ref PublicSubnet1
       RouteTableId: !Ref PublicRouteTable
-  
+
   SubnetRouteTableAssociationPublic2:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
@@ -181,7 +175,7 @@ Resources:
       Tags:
         - Key: Name
           Value: PrivateRouteTable
-  
+
   PrivateRoute:
     Type: AWS::EC2::Route
     Properties:
@@ -200,51 +194,51 @@ Resources:
     Properties:
       SubnetId: !Ref PrivateSubnet2
       RouteTableId: !Ref PrivateRouteTable
-  
 
 
 #-----------------------------------------------------------------------#
-#Part Two, Security Groups for the ALB, EC2 instances, and RDS database
+# Part Two: Security groups for the ALB, EC2 instances, and RDS database
   ALBSecurityGroup:
-      Type: AWS::EC2::SecurityGroup
-      Properties:
-        GroupDescription: Security group for the Application Load Balancer (ALB)
-        VpcId: !Ref SportsPortalVPC
-        SecurityGroupIngress:
-          - IpProtocol: tcp
-            FromPort: 80
-            ToPort: 80
-            CidrIp: '0.0.0.0/0'
-  
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for the Application Load Balancer (ALB)
+      VpcId: !Ref SportsPortalVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: '0.0.0.0/0'
+
   EC2SecurityGroup:
-      Type: AWS::EC2::SecurityGroup
-      Properties:
-        GroupDescription: Security group for the EC2 instances in the Auto Scaling Group (ASG)
-        VpcId: !Ref SportsPortalVPC
-        SecurityGroupIngress:
-          - IpProtocol: tcp
-            FromPort: 80
-            ToPort: 80
-            SourceSecurityGroupId: !Ref ALBSecurityGroup
-  
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for the EC2 instances in the Auto Scaling Group (ASG)
+      VpcId: !Ref SportsPortalVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+
   DBSecurityGroup:
-      Type: AWS::EC2::SecurityGroup
-      Properties:
-        GroupDescription: Security group for the RDS PostgreSQL database
-        VpcId: !Ref SportsPortalVPC
-        SecurityGroupIngress:
-          - IpProtocol: tcp
-            FromPort: 5432
-            ToPort: 5432
-            SourceSecurityGroupId: !Ref EC2SecurityGroup
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for the RDS PostgreSQL database
+      VpcId: !Ref SportsPortalVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
 
 
 #-----------------------------------------------------------------------#
-#Part Three, Secrets Manager for generating and storing the DB password
+# Part Three: Secrets Manager for generating and storing the DB password
+  # No fixed Name: a hard-coded name can clash on redeploy because deleted
+  # secrets stay "scheduled for deletion" for a while.
   DBSecret:
     Type: AWS::SecretsManager::Secret
     Properties:
-      Name: SportsPortalDBSecret
       Description: Secret for RDS PostgreSQL database credentials
       GenerateSecretString:
         SecretStringTemplate: !Sub '{"username": "${DBMasterUsername}"}'
@@ -254,8 +248,7 @@ Resources:
 
 
 #-----------------------------------------------------------------------#
-#Part Four, Data base 
-
+# Part Four: Database
   DBSubnetGroup:
     Type: AWS::RDS::DBSubnetGroup
     Properties:
@@ -266,7 +259,6 @@ Resources:
       Tags:
         - Key: Name
           Value: SportsPortalDBSubnetGroup
-
 
   DBInstance:
     Type: AWS::RDS::DBInstance
@@ -285,15 +277,20 @@ Resources:
       DBSubnetGroupName: !Ref DBSubnetGroup
       VPCSecurityGroups:
         - !Ref DBSecurityGroup
-      MultiAZ: false #learner lab does not support multi-AZ deployments, so this is set to false
-      PubliclyAccessible: false #Not accessible from the internet, only from the VPC
-      BackupRetentionPeriod: 2556  #snap shots from the DB for retention for 7 years
-      DeletionProtection: false #Allows the DB to be deleted when the stack is deleted
+      MultiAZ: false              # Learner Lab does not support Multi-AZ
+      PubliclyAccessible: false   # Only reachable from inside the VPC
+      BackupRetentionPeriod: 7    # RDS automated backups max out at 35 days.
+                                  # 7-year retention needs AWS Backup / manual snapshots.
+      DeletionProtection: false   # Lets the DB be deleted with the stack
 
 #-----------------------------------------------------------------------#
-#Part Five, S3 Buckets for raw photo uploads and expire after 6 months
+# Part Five: S3 buckets, SQS queues, and the Lambda image resizer
+
+  # Raw uploads. Private, expire after 1 week.
+  # DependsOn ensures the SQS queue policy exists before S3 validates the notification.
   RawPhotoBucket:
     Type: AWS::S3::Bucket
+    DependsOn: PhotoProcessingQueuePolicy
     Properties:
       BucketName: !Sub 'sportsportal-raw-photos-${AWS::AccountId}-${AWS::Region}'
       PublicAccessBlockConfiguration:
@@ -306,40 +303,71 @@ Resources:
           - Id: ExpireRawPhotos
             Status: Enabled
             ExpirationInDays: 7
+      # New uploads send a message to the SQS queue, which triggers the Lambda
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Queue: !GetAtt PhotoProcessingQueue.Arn
 
-  #s3 bucket for resized images
+  # Resized images. Private, expire after 6 months.
   ResizedPhotoBucket:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: !Sub 'sportsportal-resized-photos-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
       LifecycleConfiguration:
         Rules:
-          - Id: ExpireRawPhotos
+          - Id: ExpireResizedPhotos
             Status: Enabled
-            ExpirationInDays: 180 #expire after 6 months
-  
-  PhotoProcessingQueue:
-    Type: AWS::SQS::Queue
-    Properties:
-      QueueName: !Sub 'sportsportal-photo-processing-queue-${AWS::AccountId}-${AWS::Region}'
-      VisibilityTimeout: 60 #seconds, time for the Lambda to process the message before it becomes visible again
-      RedrivePolicy:
-        deadLetterTargetArn: !GetAtt PhotoProcessingDeadLetterQueue.Arn
-        maxReceiveCount: 3
+            ExpirationInDays: 180
 
   PhotoProcessingDeadLetterQueue:
     Type: AWS::SQS::Queue
     Properties:
       QueueName: !Sub 'sportsportal-photo-processing-dead-letter-queue-${AWS::AccountId}-${AWS::Region}'
 
-  #Lambda function to resize images asynchronously when they are uploaded to the raw photo bucket
+  PhotoProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'sportsportal-photo-processing-queue-${AWS::AccountId}-${AWS::Region}'
+      VisibilityTimeout: 60   # Must be >= the Lambda timeout (30s)
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt PhotoProcessingDeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  # Lets S3 send messages to the queue. The bucket ARN is built from its name
+  # (not GetAtt) so there is no circular dependency with the bucket.
+  PhotoProcessingQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref PhotoProcessingQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: 'sqs:SendMessage'
+            Resource: !GetAtt PhotoProcessingQueue.Arn
+            Condition:
+              ArnLike:
+                'aws:SourceArn': !Sub 'arn:aws:s3:::sportsportal-raw-photos-${AWS::AccountId}-${AWS::Region}'
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+
+  # Lambda that resizes images asynchronously (stub logic for demo purposes)
   ImageResizerLambda:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub 'sportsportal-image-resizer-${AWS::AccountId}-${AWS::Region}'
-      Runtime: nodejs18.x
+      Runtime: nodejs22.x
       Handler: index.handler
-      Role: !Ref LabRoleArn
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/LabRole'
       Timeout: 30
       MemorySize: 256
       Environment:
@@ -348,12 +376,21 @@ Resources:
       Code:
         ZipFile: |
           exports.handler = async (event) => {
-            console.log("Processing SQS photo resize event asynchronously:", JSON.stringify(event, null, 2));
-            // Asynchronous resize logic simulation
-            return { statusCode: 200, body: "Image resized and stored successfully" };
+            for (const record of event.Records) {
+              const body = JSON.parse(record.body);
+              // S3 sends a test event when notifications are first configured
+              if (body.Event === 's3:TestEvent') continue;
+              for (const s3Record of body.Records || []) {
+                const bucket = s3Record.s3.bucket.name;
+                const key = decodeURIComponent(s3Record.s3.object.key.replace(/\+/g, ' '));
+                console.log(`Resize requested for s3://${bucket}/${key}`);
+                // Real resize logic would go here and write to process.env.RESIZED_BUCKET
+              }
+            }
+            return { statusCode: 200, body: "Image resize processing complete" };
           };
 
-  #connects the SQS queue to the Lambda function so that when a message is sent to the queue, the Lambda function is triggered
+  # Triggers the Lambda whenever a message arrives in the queue
   LambdaEventSourceMapping:
     Type: AWS::Lambda::EventSourceMapping
     Properties:
@@ -363,7 +400,7 @@ Resources:
       Enabled: true
 
 #-----------------------------------------------------------------------#
-# Part Six, Application Load Balancer (ALB) and Auto Scaling Group (ASG) for the EC2 instances
+# Part Six: Application Load Balancer and Auto Scaling Group
   ApplicationLoadBalancer:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
@@ -373,7 +410,7 @@ Resources:
         - !Ref PublicSubnet2
       SecurityGroups:
         - !Ref ALBSecurityGroup
-  
+
   ALBTargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
@@ -385,7 +422,7 @@ Resources:
       HealthCheckPath: /
       HealthCheckIntervalSeconds: 30
       UnhealthyThresholdCount: 3
-  
+
   ALBListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Properties:
@@ -407,7 +444,7 @@ Resources:
         SecurityGroupIds:
           - !Ref EC2SecurityGroup
         UserData:
-          Fn::Base64: !Sub |
+          Fn::Base64: |
             #!/bin/bash
             yum update -y
             amazon-linux-extras install -y nginx1
@@ -415,8 +452,10 @@ Resources:
             systemctl start nginx
             echo "<h1>Welcome to the Regional Sports Portal</h1>" > /usr/share/nginx/html/index.html
 
+  # DependsOn PrivateRoute so instances have NAT access to run yum on boot
   AutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: PrivateRoute
     Properties:
       VPCZoneIdentifier:
         - !Ref PrivateSubnet1
@@ -431,7 +470,7 @@ Resources:
         - !Ref ALBTargetGroup
       HealthCheckType: ELB
       HealthCheckGracePeriod: 300
-  
+
   AutoScalingPolicy:
     Type: AWS::AutoScaling::ScalingPolicy
     Properties:
@@ -443,7 +482,7 @@ Resources:
         TargetValue: 60.0
 
 #-----------------------------------------------------------------------#
-#Part Seven, CloudWatch Dashboard and Alarm for monitoring the ALB and EC2 instances
+# Part Seven: CloudWatch dashboard and alarm
   SNSTopic:
     Type: AWS::SNS::Topic
     Properties:
@@ -466,7 +505,9 @@ Resources:
           Value: !Ref AutoScalingGroup
       AlarmActions:
         - !Ref SNSTopic
-  
+
+  # The ALB metric dimension must be the load balancer's "full name"
+  # (app/<name>/<id>), not its ARN, or the widget will show no data.
   OperationDashboard:
     Type: AWS::CloudWatch::Dashboard
     Properties:
@@ -498,7 +539,7 @@ Resources:
               "height": 6,
               "properties": {
                 "metrics": [
-                  [ "AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${ApplicationLoadBalancer}" ]
+                  [ "AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${ApplicationLoadBalancer.LoadBalancerFullName}" ]
                 ],
                 "period": 300,
                 "stat": "Sum",
@@ -513,11 +554,15 @@ Outputs:
   PortalURL:
     Description: "URL of the Regional Sports Portal"
     Value: !Sub "http://${ApplicationLoadBalancer.DNSName}"
-  
+
   RawPhotoBucketName:
     Description: "Name of the S3 bucket for raw photo uploads"
     Value: !Ref RawPhotoBucket
 
-  SecretName:
-    Description: "Name of the Secrets Manager secret for RDS credentials"
+  ResizedPhotoBucketName:
+    Description: "Name of the S3 bucket for resized photos"
+    Value: !Ref ResizedPhotoBucket
+
+  SecretArn:
+    Description: "ARN of the Secrets Manager secret for RDS credentials"
     Value: !Ref DBSecret
