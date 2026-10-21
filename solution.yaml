@@ -1,40 +1,84 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  AWS CloudFormation Template for Regional Sports Portal.
-  Deploys a 2-AZ VPC, Public ALB, Private ASG (EC2), Private RDS,
-  S3 Buckets, SQS Queue, Lambda Image Resizer, Secrets Manager, and CloudWatch Dashboard/Alarm.
-  Designed for the AWS Academy Learner Lab (uses LabRole / LabInstanceProfile).
+  Regional Sports Portal. 2-AZ VPC, public ALB, private Auto Scaling web tier running a
+  member portal (registration, renewals, court bookings, profile photos), private RDS PostgreSQL
+  with 7-year AWS Backup retention, direct-to-S3 photo uploads resized asynchronously via SQS + Lambda,
+  Secrets Manager, and CloudWatch monitoring. Designed for the AWS Academy Learner Lab.
 
 Parameters:
   VpcCidr:
     Type: String
     Default: '10.0.0.0/16'
-    Description: CIDR block for the custom Virtual Private Cloud (VPC).
 
   DatabaseName:
     Type: String
     Default: 'sportsportal'
-    Description: Initial relational database name for member and booking records.
 
   DBMasterUsername:
     Type: String
     Default: 'portaladmin'
-    Description: Master administrative username for the RDS PostgreSQL database.
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.small
+    Description: Database size. Registration night is the busy period, so db.t3.micro is too small.
+
+  InstanceType:
+    Type: String
+    Default: t3.small
+    Description: Web server size.
 
   LabInstanceProfileName:
     Type: String
     Default: 'LabInstanceProfile'
-    Description: Pre-existing Learner Lab Instance Profile attached to EC2 instances.
 
-  LatestAmazonLinux2AMI:
+  LatestAmazonLinuxAMI:
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
-    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
-    Description: Latest Amazon Linux 2 AMI ID for this region.
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Latest Amazon Linux 2023 AMI for this region.
+
+  PreWarmMinSize:
+    Type: Number
+    Default: 4
+    MinValue: 2
+    MaxValue: 6
+    Description: Minimum web servers during the Monday-evening pre-warm window (must be <= 6).
+
+  ResizedPhotoRetentionDays:
+    Type: Number
+    Default: 400
+    Description: >
+      Days to keep resized profile photos. Kept just over 12 months so a member's photo does
+      not vanish before their annual renewal. Raw uploads are always deleted after 7 days.
+
+  EnableResizing:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Build the Pillow image library layer from inside this template (a helper Lambda downloads
+      it from PyPI). Set to false if that fails in your lab; photos are then stored unresized.
+
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: OPTIONAL. Email address to notify when an alarm fires.
+
+  EnableLongTermBackup:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Create the AWS Backup plan that keeps monthly database backups for 7 years.
+
+Conditions:
+  BuildPillowLayer: !Equals [!Ref EnableResizing, 'true']
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+  UseLongTermBackup: !Equals [!Ref EnableLongTermBackup, 'true']
 
 
-#----------------------------------------------------------------------#
-# Part One: VPC, subnets, gateways and route tables
 Resources:
+#----------------------------------------------------------------------#
+# Part One: VPC, subnets, gateways, route tables
   SportsPortalVPC:
     Type: AWS::EC2::VPC
     Properties:
@@ -58,7 +102,6 @@ Resources:
       VpcId: !Ref SportsPortalVPC
       InternetGatewayId: !Ref SportsPortalInternetGateway
 
-  # Public subnets
   PublicSubnet1:
     Type: AWS::EC2::Subnet
     Properties:
@@ -81,7 +124,6 @@ Resources:
         - Key: Name
           Value: PublicSubnetAZ2
 
-  # Private application subnets
   PrivateSubnet1:
     Type: AWS::EC2::Subnet
     Properties:
@@ -102,7 +144,6 @@ Resources:
         - Key: Name
           Value: PrivateSubnetAZ2
 
-  # Private database subnets
   PrivateDBSubnet1:
     Type: AWS::EC2::Subnet
     Properties:
@@ -123,7 +164,6 @@ Resources:
         - Key: Name
           Value: PrivateDBSubnetAZ2
 
-  # Elastic IP and NAT gateway for outbound traffic from private subnets
   EIPNat:
     Type: AWS::EC2::EIP
     DependsOn: VPCGatewayAttachment
@@ -139,7 +179,6 @@ Resources:
         - Key: Name
           Value: NatGateway
 
-  # Route tables
   PublicRouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
@@ -197,11 +236,11 @@ Resources:
 
 
 #-----------------------------------------------------------------------#
-# Part Two: Security groups for the ALB, EC2 instances, and RDS database
+# Part Two: Security groups (ALB -> web servers on 8080 -> database)
   ALBSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Security group for the Application Load Balancer (ALB)
+      GroupDescription: Security group for the Application Load Balancer
       VpcId: !Ref SportsPortalVPC
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -212,18 +251,18 @@ Resources:
   EC2SecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Security group for the EC2 instances in the Auto Scaling Group (ASG)
+      GroupDescription: Security group for the web servers (traffic from the ALB only)
       VpcId: !Ref SportsPortalVPC
       SecurityGroupIngress:
         - IpProtocol: tcp
-          FromPort: 80
-          ToPort: 80
+          FromPort: 8080
+          ToPort: 8080
           SourceSecurityGroupId: !Ref ALBSecurityGroup
 
   DBSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Security group for the RDS PostgreSQL database
+      GroupDescription: Security group for the RDS PostgreSQL database (web servers only)
       VpcId: !Ref SportsPortalVPC
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -233,9 +272,7 @@ Resources:
 
 
 #-----------------------------------------------------------------------#
-# Part Three: Secrets Manager for generating and storing the DB password
-  # No fixed Name: a hard-coded name can clash on redeploy because deleted
-  # secrets stay "scheduled for deletion" for a while.
+# Part Three: Secrets Manager (generated DB password)
   DBSecret:
     Type: AWS::SecretsManager::Secret
     Properties:
@@ -246,9 +283,19 @@ Resources:
         PasswordLength: 16
         ExcludePunctuation: true
 
+  # Signs login cookies. Generated by Secrets Manager, so it is not in the code or template
+  # and is not derived from the database password.
+  SessionSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Session signing key for the portal
+      GenerateSecretString:
+        PasswordLength: 48
+        ExcludePunctuation: true
+
 
 #-----------------------------------------------------------------------#
-# Part Four: Database
+# Part Four: Database (the system of record for members, renewals, bookings)
   DBSubnetGroup:
     Type: AWS::RDS::DBSubnetGroup
     Properties:
@@ -256,16 +303,17 @@ Resources:
       SubnetIds:
         - !Ref PrivateDBSubnet1
         - !Ref PrivateDBSubnet2
-      Tags:
-        - Key: Name
-          Value: SportsPortalDBSubnetGroup
 
+  # DeletionPolicy Snapshot: deleting the stack leaves a final snapshot behind
+  # instead of destroying member records (they must be kept for 7 years).
   DBInstance:
     Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
     Properties:
       Engine: postgres
       EngineVersion: "15"
-      DBInstanceClass: db.t3.micro
+      DBInstanceClass: !Ref DBInstanceClass
       AllocatedStorage: 20
       DBName: !Ref DatabaseName
       MasterUsername: !Ref DBMasterUsername
@@ -277,17 +325,58 @@ Resources:
       DBSubnetGroupName: !Ref DBSubnetGroup
       VPCSecurityGroups:
         - !Ref DBSecurityGroup
-      MultiAZ: false              # Learner Lab does not support Multi-AZ
-      PubliclyAccessible: false   # Only reachable from inside the VPC
-      BackupRetentionPeriod: 7    # RDS automated backups max out at 35 days.
-                                  # 7-year retention needs AWS Backup / manual snapshots.
-      DeletionProtection: false   # Lets the DB be deleted with the stack
+      MultiAZ: false              # Learner Lab does not support Multi-AZ. Turn on for real use.
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 7    # Short-term point-in-time recovery (RDS max is 35 days)
+      DeletionProtection: false   # Lab only. Set true for real use.
+
+  # --- 7-year retention: AWS Backup keeps monthly copies for 2557 days ---
+  # The vault is Retain'd on stack delete so the backups outlive the stack.
+  # Its name includes the stack GUID so redeploying never collides with a retained vault.
+  BackupVault:
+    Type: AWS::Backup::BackupVault
+    Condition: UseLongTermBackup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BackupVaultName: !Join
+        - ''
+        - - 'sp-vault-'
+          - !Select [2, !Split ['/', !Ref 'AWS::StackId']]
+
+  BackupPlan:
+    Type: AWS::Backup::BackupPlan
+    Condition: UseLongTermBackup
+    Properties:
+      BackupPlan:
+        BackupPlanName: !Sub 'sportsportal-backup-plan-${AWS::AccountId}'
+        BackupPlanRule:
+          - RuleName: DailyKeep35Days
+            TargetBackupVault: !Ref BackupVault
+            ScheduleExpression: 'cron(0 17 * * ? *)'
+            Lifecycle:
+              DeleteAfterDays: 35
+          - RuleName: MonthlyKeep7Years
+            TargetBackupVault: !Ref BackupVault
+            ScheduleExpression: 'cron(0 17 1 * ? *)'
+            Lifecycle:
+              DeleteAfterDays: 2557
+
+  BackupSelection:
+    Type: AWS::Backup::BackupSelection
+    Condition: UseLongTermBackup
+    Properties:
+      BackupPlanId: !Ref BackupPlan
+      BackupSelection:
+        SelectionName: sportsportal-database
+        IamRoleArn: !Sub 'arn:aws:iam::${AWS::AccountId}:role/LabRole'
+        Resources:
+          - !Sub 'arn:aws:rds:${AWS::Region}:${AWS::AccountId}:db:${DBInstance}'
+
 
 #-----------------------------------------------------------------------#
-# Part Five: S3 buckets, SQS queues, and the Lambda image resizer
-
-  # Raw uploads. Private, expire after 1 week.
-  # DependsOn ensures the SQS queue policy exists before S3 validates the notification.
+# Part Five: Photos. Browser uploads straight to S3 (never through the web servers).
+# S3 -> SQS -> Lambda resizes in the background; the member never waits.
   RawPhotoBucket:
     Type: AWS::S3::Bucket
     DependsOn: PhotoProcessingQueuePolicy
@@ -298,18 +387,23 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+      # Lets the browser POST the photo directly to S3 using a short-lived signed form
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [POST]
+            AllowedOrigins: ['*']
+            AllowedHeaders: ['*']
+            MaxAge: 3000
       LifecycleConfiguration:
         Rules:
           - Id: ExpireRawPhotos
             Status: Enabled
             ExpirationInDays: 7
-      # New uploads send a message to the SQS queue, which triggers the Lambda
       NotificationConfiguration:
         QueueConfigurations:
           - Event: 's3:ObjectCreated:*'
             Queue: !GetAtt PhotoProcessingQueue.Arn
 
-  # Resized images. Private, expire after 6 months.
   ResizedPhotoBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -323,24 +417,23 @@ Resources:
         Rules:
           - Id: ExpireResizedPhotos
             Status: Enabled
-            ExpirationInDays: 180
+            ExpirationInDays: !Ref ResizedPhotoRetentionDays
 
   PhotoProcessingDeadLetterQueue:
     Type: AWS::SQS::Queue
     Properties:
       QueueName: !Sub 'sportsportal-photo-processing-dead-letter-queue-${AWS::AccountId}-${AWS::Region}'
+      MessageRetentionPeriod: 1209600   # 14 days to investigate failures
 
   PhotoProcessingQueue:
     Type: AWS::SQS::Queue
     Properties:
       QueueName: !Sub 'sportsportal-photo-processing-queue-${AWS::AccountId}-${AWS::Region}'
-      VisibilityTimeout: 60   # Must be >= the Lambda timeout (30s)
+      VisibilityTimeout: 180   # >= Lambda timeout (a safe multiple is recommended)
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt PhotoProcessingDeadLetterQueue.Arn
         maxReceiveCount: 3
 
-  # Lets S3 send messages to the queue. The bucket ARN is built from its name
-  # (not GetAtt) so there is no circular dependency with the bucket.
   PhotoProcessingQueuePolicy:
     Type: AWS::SQS::QueuePolicy
     Properties:
@@ -360,37 +453,129 @@ Resources:
               StringEquals:
                 'aws:SourceAccount': !Ref 'AWS::AccountId'
 
-  # Lambda that resizes images asynchronously (stub logic for demo purposes)
+  # Helper that builds the Pillow layer during deployment, so no manual step is needed.
+  # If PyPI cannot be reached it publishes an empty layer and the resizer stores originals.
+  LayerBuilderFunction:
+    Type: AWS::Lambda::Function
+    Condition: BuildPillowLayer
+    Properties:
+      FunctionName: !Sub 'sportsportal-layer-builder-${AWS::AccountId}-${AWS::Region}'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/LabRole'
+      Timeout: 300
+      MemorySize: 1024
+      Code:
+        ZipFile: |
+          import io, json, urllib.request, zipfile
+          import boto3
+          import cfnresponse
+
+          lam = boto3.client("lambda")
+
+          def wheel_url():
+              with urllib.request.urlopen("https://pypi.org/pypi/Pillow/json", timeout=30) as r:
+                  files = json.load(r)["urls"]
+              for f in files:
+                  n = f["filename"]
+                  if "cp312-cp312-manylinux" in n and "x86_64" in n:
+                      return f["url"]
+              raise RuntimeError("no matching Pillow wheel")
+
+          def build_zip():
+              out = io.BytesIO()
+              with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+                  try:
+                      wheel = urllib.request.urlopen(wheel_url(), timeout=120).read()
+                      with zipfile.ZipFile(io.BytesIO(wheel)) as w:
+                          for n in w.namelist():
+                              if n.endswith("/"):
+                                  continue
+                              zi = zipfile.ZipInfo("python/" + n)
+                              zi.external_attr = 0o644 << 16     # layer files must be world-readable
+                              zi.compress_type = zipfile.ZIP_DEFLATED
+                              z.writestr(zi, w.read(n))
+                  except Exception as e:
+                      print("Could not fetch Pillow, publishing an empty layer:", e)
+                      z.writestr("python/README.txt", "Pillow unavailable")
+              return out.getvalue()
+
+          def handler(event, context):
+              pid = event.get("PhysicalResourceId", "none")
+              try:
+                  if event["RequestType"] == "Delete":
+                      try:
+                          parts = pid.split(":")
+                          lam.delete_layer_version(LayerName=parts[6], VersionNumber=int(parts[7]))
+                      except Exception as e:
+                          print("Layer cleanup skipped:", e)
+                  else:
+                      r = lam.publish_layer_version(
+                          LayerName=event["ResourceProperties"]["LayerName"],
+                          Content={"ZipFile": build_zip()},
+                          CompatibleRuntimes=["python3.12"],
+                          CompatibleArchitectures=["x86_64"])
+                      pid = r["LayerVersionArn"]
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {"LayerArn": pid}, pid)
+              except Exception as e:
+                  print(e)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, pid)
+
+  PillowLayer:
+    Type: Custom::PillowLayer
+    Condition: BuildPillowLayer
+    Properties:
+      ServiceToken: !GetAtt LayerBuilderFunction.Arn
+      LayerName: sportsportal-pillow
+
   ImageResizerLambda:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub 'sportsportal-image-resizer-${AWS::AccountId}-${AWS::Region}'
-      Runtime: nodejs22.x
+      Runtime: python3.12
       Handler: index.handler
       Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/LabRole'
-      Timeout: 30
-      MemorySize: 256
+      Timeout: 60
+      MemorySize: 512
+      Layers: !If [BuildPillowLayer, [!GetAtt PillowLayer.LayerArn], !Ref 'AWS::NoValue']
       Environment:
         Variables:
           RESIZED_BUCKET: !Ref ResizedPhotoBucket
       Code:
         ZipFile: |
-          exports.handler = async (event) => {
-            for (const record of event.Records) {
-              const body = JSON.parse(record.body);
-              // S3 sends a test event when notifications are first configured
-              if (body.Event === 's3:TestEvent') continue;
-              for (const s3Record of body.Records || []) {
-                const bucket = s3Record.s3.bucket.name;
-                const key = decodeURIComponent(s3Record.s3.object.key.replace(/\+/g, ' '));
-                console.log(`Resize requested for s3://${bucket}/${key}`);
-                // Real resize logic would go here and write to process.env.RESIZED_BUCKET
-              }
-            }
-            return { statusCode: 200, body: "Image resize processing complete" };
-          };
+          import io, os, json, urllib.parse
+          import boto3
 
-  # Triggers the Lambda whenever a message arrives in the queue
+          try:
+              from PIL import Image, ImageOps
+          except ImportError:
+              Image = None
+
+          s3 = boto3.client("s3")
+          RESIZED = os.environ["RESIZED_BUCKET"]
+
+          def handler(event, context):
+              for rec in event["Records"]:
+                  body = json.loads(rec["body"])
+                  # S3 sends a Records-less test event when notifications are first set up
+                  for r in body.get("Records", []):
+                      bucket = r["s3"]["bucket"]["name"]
+                      key = urllib.parse.unquote_plus(r["s3"]["object"]["key"])
+                      member_id = key.split("/")[1]          # uploads/<member_id>/<random>
+                      data = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+                      if Image:
+                          img = ImageOps.exif_transpose(Image.open(io.BytesIO(data))).convert("RGB")
+                          img.thumbnail((512, 512))
+                          out = io.BytesIO()
+                          img.save(out, "JPEG", quality=85)
+                          data = out.getvalue()
+                      else:
+                          print("Pillow unavailable: storing original photo unresized")
+                      s3.put_object(Bucket=RESIZED, Key="photos/%s.jpg" % member_id,
+                                    Body=data, ContentType="image/jpeg")
+                      print("Processed", key)
+              return {"statusCode": 200}
+
   LambdaEventSourceMapping:
     Type: AWS::Lambda::EventSourceMapping
     Properties:
@@ -398,9 +583,12 @@ Resources:
       EventSourceArn: !GetAtt PhotoProcessingQueue.Arn
       FunctionName: !GetAtt ImageResizerLambda.Arn
       Enabled: true
+      ScalingConfig:
+        MaximumConcurrency: 5   # Keeps a burst of uploads within Learner Lab Lambda limits
+
 
 #-----------------------------------------------------------------------#
-# Part Six: Application Load Balancer and Auto Scaling Group
+# Part Six: Load balancer and Auto Scaling web tier running the portal
   ApplicationLoadBalancer:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
@@ -415,12 +603,13 @@ Resources:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
       Name: !Sub 'sp-tg-${AWS::AccountId}'
-      Port: 80
+      Port: 8080
       Protocol: HTTP
       VpcId: !Ref SportsPortalVPC
       TargetType: instance
-      HealthCheckPath: /
+      HealthCheckPath: /health      # Does not touch the DB, so a DB blip doesn't kill every server
       HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
       UnhealthyThresholdCount: 3
 
   ALBListener:
@@ -437,25 +626,287 @@ Resources:
     Type: AWS::EC2::LaunchTemplate
     Properties:
       LaunchTemplateData:
-        InstanceType: t3.micro
-        ImageId: !Ref LatestAmazonLinux2AMI
+        InstanceType: !Ref InstanceType
+        ImageId: !Ref LatestAmazonLinuxAMI
         IamInstanceProfile:
           Name: !Ref LabInstanceProfileName
         SecurityGroupIds:
           - !Ref EC2SecurityGroup
         UserData:
-          Fn::Base64: |
+          Fn::Base64: !Sub |
             #!/bin/bash
-            yum update -y
-            amazon-linux-extras install -y nginx1
-            systemctl enable nginx
-            systemctl start nginx
-            echo "<h1>Welcome to the Regional Sports Portal</h1>" > /usr/share/nginx/html/index.html
+            dnf install -y python3-pip
+            pip3 install flask psycopg2-binary boto3 gunicorn
 
-  # DependsOn PrivateRoute so instances have NAT access to run yum on boot
+            mkdir -p /opt/portal
+            cat > /etc/portal.env <<EOF
+            AWS_DEFAULT_REGION=${AWS::Region}
+            AWS_REGION=${AWS::Region}
+            DB_HOST=${DBInstance.Endpoint.Address}
+            DB_NAME=${DatabaseName}
+            DB_SECRET_ARN=${DBSecret}
+            SESSION_SECRET_ARN=${SessionSecret}
+            RAW_BUCKET=${RawPhotoBucket}
+            RESIZED_BUCKET=${ResizedPhotoBucket}
+            EOF
+
+            cat > /opt/portal/app.py <<'PYEOF'
+            import os, json, uuid, hashlib, datetime, threading
+            import boto3, psycopg2
+            from botocore.config import Config
+            from psycopg2.pool import ThreadedConnectionPool
+            from flask import (Flask, request, session, redirect, render_template_string,
+                               jsonify, flash, abort)
+            from werkzeug.security import generate_password_hash, check_password_hash
+
+            REGION = os.environ["AWS_REGION"]
+            RAW, RESIZED = os.environ["RAW_BUCKET"], os.environ["RESIZED_BUCKET"]
+            s3 = boto3.client("s3", region_name=REGION, config=Config(signature_version="s3v4"))
+
+            app = Flask(__name__)
+            sm = boto3.client("secretsmanager", region_name=REGION)
+            _sec = json.loads(sm.get_secret_value(SecretId=os.environ["DB_SECRET_ARN"])["SecretString"])
+            # Separate generated secret, shared by all servers so a login works whichever one answers
+            app.secret_key = sm.get_secret_value(SecretId=os.environ["SESSION_SECRET_ARN"])["SecretString"]
+
+            SCHEMA = """
+            CREATE TABLE IF NOT EXISTS clubs (id SERIAL PRIMARY KEY, name TEXT UNIQUE NOT NULL);
+            CREATE TABLE IF NOT EXISTS courts (id SERIAL PRIMARY KEY, club_id INT REFERENCES clubs(id),
+              name TEXT NOT NULL, UNIQUE(club_id, name));
+            CREATE TABLE IF NOT EXISTS members (id SERIAL PRIMARY KEY, email TEXT UNIQUE NOT NULL,
+              full_name TEXT NOT NULL, club_id INT REFERENCES clubs(id), pw_hash TEXT NOT NULL,
+              created_at TIMESTAMPTZ DEFAULT now(), expires_on DATE NOT NULL);
+            CREATE TABLE IF NOT EXISTS renewals (id SERIAL PRIMARY KEY, member_id INT REFERENCES members(id),
+              renewed_at TIMESTAMPTZ DEFAULT now(), new_expiry DATE NOT NULL);
+            CREATE TABLE IF NOT EXISTS bookings (id SERIAL PRIMARY KEY, member_id INT REFERENCES members(id),
+              court_id INT REFERENCES courts(id), slot_date DATE NOT NULL, slot_hour INT NOT NULL,
+              created_at TIMESTAMPTZ DEFAULT now(), UNIQUE(court_id, slot_date, slot_hour));
+            INSERT INTO clubs(name) SELECT 'Club ' || lpad(g::text, 2, '0') FROM generate_series(1,12) g
+              ON CONFLICT DO NOTHING;
+            INSERT INTO courts(club_id, name) SELECT c.id, 'Court ' || n FROM clubs c, generate_series(1,4) n
+              ON CONFLICT DO NOTHING;
+            """
+            _pool, _lock = None, threading.Lock()
+
+            def pool():
+                global _pool
+                with _lock:
+                    if _pool is None:
+                        p = ThreadedConnectionPool(1, 5, host=os.environ["DB_HOST"], dbname=os.environ["DB_NAME"],
+                                                   user=_sec["username"], password=_sec["password"], sslmode="require")
+                        c = p.getconn()
+                        with c.cursor() as cur:
+                            cur.execute("SELECT pg_advisory_xact_lock(42)")   # one server builds the schema at a time
+                            cur.execute(SCHEMA)
+                        c.commit()
+                        p.putconn(c)
+                        _pool = p
+                return _pool
+
+            def q(sql, args=(), one=False):
+                p = pool()
+                c = p.getconn()
+                try:
+                    with c.cursor() as cur:
+                        cur.execute(sql, args)
+                        rows = cur.fetchall() if cur.description else None
+                    c.commit()
+                    return (rows[0] if rows else None) if one else rows
+                except Exception:
+                    c.rollback()
+                    raise
+                finally:
+                    p.putconn(c)
+
+            PAGE = """<!doctype html><html><head><meta charset=utf-8>
+            <meta name=viewport content="width=device-width,initial-scale=1"><title>Regional Sports Portal</title>
+            <style>body{font-family:system-ui,sans-serif;max-width:720px;margin:2rem auto;padding:0 1rem;color:#222}
+            nav a{margin-right:1rem}input,select,button{font:inherit;padding:.4rem;margin:.2rem 0}
+            label{display:block;margin-top:.6rem}.msg{background:#eef;padding:.5rem;border-radius:4px}
+            td,th{padding:.3rem .8rem;border-bottom:1px solid #ddd;text-align:left}
+            img.avatar{width:120px;height:120px;object-fit:cover;border-radius:50%;background:#ddd}</style></head><body>
+            <h1>Regional Sports Portal</h1>
+            <nav>{% if session.get('mid') %}<a href="/">My membership</a><a href="/book">Book a court</a><a href="/logout">Log out</a>
+            {% else %}<a href="/login">Log in</a><a href="/register">Join</a>{% endif %}</nav><hr>
+            {% for m in get_flashed_messages() %}<p class=msg>{{ m }}</p>{% endfor %}
+            @@BODY@@</body></html>"""
+
+            def page(body, **ctx):
+                return render_template_string(PAGE.replace("@@BODY@@", body), **ctx)
+
+            def me():
+                if "mid" not in session:
+                    return None
+                return q("SELECT m.id, m.full_name, m.email, c.name, m.expires_on FROM members m "
+                         "JOIN clubs c ON c.id = m.club_id WHERE m.id = %s", (session["mid"],), one=True)
+
+            @app.route("/health")
+            def health():
+                return "ok"
+
+            HOME = """<h2>Hello {{ m[1] }}</h2>
+            <img class=avatar src="/photo/me" alt="" onerror="this.style.visibility='hidden'">
+            <p>{{ m[3] }} &middot; Membership: <b>{{ status }}</b> until {{ m[4] }}</p>
+            <form method=post action="/renew"><button>Renew for 12 months</button></form>
+            <h3>Profile photo</h3>
+            <input type=file id=f accept="image/*"> <button id=up>Upload</button> <span id=st></span>
+            <script>
+            var f = document.getElementById('f'), st = document.getElementById('st');
+            document.getElementById('up').onclick = async function () {
+              if (!f.files.length) { st.textContent = 'Choose a photo first.'; return; }
+              st.textContent = 'Uploading...';
+              var r = await fetch('/photo/upload-url', {method: 'POST'});
+              var d = await r.json();
+              var fd = new FormData();
+              Object.keys(d.fields).forEach(function (k) { fd.append(k, d.fields[k]); });
+              fd.append('file', f.files[0]);
+              var u = await fetch(d.url, {method: 'POST', body: fd});
+              st.textContent = u.ok ? 'Photo received! It will appear here shortly.' : 'Upload failed, please try again.';
+            };
+            </script>"""
+
+            @app.route("/")
+            def home():
+                m = me()
+                if not m:
+                    return redirect("/login")
+                status = "Active" if m[4] >= datetime.date.today() else "Expired"
+                return page(HOME, m=m, status=status)
+
+            REG = """<h2>Join the association</h2><form method=post>
+            <label>Full name <input name=name required></label>
+            <label>Email <input name=email type=email required></label>
+            <label>Password (8+ characters) <input name=password type=password minlength=8 required></label>
+            <label>Club <select name=club>{% for c in clubs %}<option value="{{ c[0] }}">{{ c[1] }}</option>{% endfor %}</select></label>
+            <button>Register</button></form>"""
+
+            @app.route("/register", methods=["GET", "POST"])
+            def register():
+                if request.method == "POST":
+                    f = request.form
+                    if len(f["password"]) < 8:
+                        flash("Password must be at least 8 characters.")
+                    else:
+                        exp = datetime.date.today() + datetime.timedelta(days=365)
+                        try:
+                            row = q("INSERT INTO members(email, full_name, club_id, pw_hash, expires_on) "
+                                    "VALUES (%s,%s,%s,%s,%s) RETURNING id",
+                                    (f["email"].strip().lower(), f["name"].strip(), int(f["club"]),
+                                     generate_password_hash(f["password"], method="pbkdf2:sha256"), exp), one=True)
+                            q("INSERT INTO renewals(member_id, new_expiry) VALUES (%s,%s)", (row[0], exp))
+                            session["mid"] = row[0]
+                            return redirect("/")
+                        except psycopg2.errors.UniqueViolation:
+                            flash("That email is already registered.")
+                return page(REG, clubs=q("SELECT id, name FROM clubs ORDER BY id"))
+
+            LOGIN = """<h2>Log in</h2><form method=post>
+            <label>Email <input name=email type=email required></label>
+            <label>Password <input name=password type=password required></label>
+            <button>Log in</button></form>"""
+
+            @app.route("/login", methods=["GET", "POST"])
+            def login():
+                if request.method == "POST":
+                    row = q("SELECT id, pw_hash FROM members WHERE email = %s",
+                            (request.form["email"].strip().lower(),), one=True)
+                    if row and check_password_hash(row[1], request.form["password"]):
+                        session["mid"] = row[0]
+                        return redirect("/")
+                    flash("Wrong email or password.")
+                return page(LOGIN)
+
+            @app.route("/logout")
+            def logout():
+                session.clear()
+                return redirect("/login")
+
+            @app.route("/renew", methods=["POST"])
+            def renew():
+                m = me()
+                if not m:
+                    return redirect("/login")
+                exp = max(m[4], datetime.date.today()) + datetime.timedelta(days=365)
+                q("UPDATE members SET expires_on = %s WHERE id = %s", (exp, m[0]))
+                q("INSERT INTO renewals(member_id, new_expiry) VALUES (%s,%s)", (m[0], exp))
+                flash("Membership renewed until %s." % exp)
+                return redirect("/")
+
+            BOOK = """<h2>Book a court</h2><form method=post>
+            <label>Court <select name=court>{% for c in courts %}<option value="{{ c[0] }}">{{ c[1] }}</option>{% endfor %}</select></label>
+            <label>Date <input type=date name=date min="{{ today }}" required></label>
+            <label>Hour <select name=hour>{% for h in hours %}<option value="{{ h }}">{{ '%02d:00' % h }}</option>{% endfor %}</select></label>
+            <button>Book</button></form>
+            <h3>My upcoming bookings</h3><table><tr><th>Date</th><th>Time</th><th>Club</th><th>Court</th></tr>
+            {% for b in mine %}<tr><td>{{ b[0] }}</td><td>{{ '%02d:00' % b[1] }}</td><td>{{ b[2] }}</td><td>{{ b[3] }}</td></tr>{% endfor %}</table>"""
+
+            @app.route("/book", methods=["GET", "POST"])
+            def book():
+                m = me()
+                if not m:
+                    return redirect("/login")
+                if m[4] < datetime.date.today():
+                    flash("Your membership has expired. Please renew to book courts.")
+                    return redirect("/")
+                if request.method == "POST":
+                    try:
+                        q("INSERT INTO bookings(member_id, court_id, slot_date, slot_hour) VALUES (%s,%s,%s,%s)",
+                          (m[0], int(request.form["court"]), request.form["date"], int(request.form["hour"])))
+                        flash("Court booked.")
+                    except psycopg2.errors.UniqueViolation:
+                        flash("Sorry, that slot was just taken.")   # the UNIQUE constraint prevents double-booking
+                    return redirect("/book")
+                courts = q("SELECT ct.id, cl.name || ' - ' || ct.name FROM courts ct "
+                           "JOIN clubs cl ON cl.id = ct.club_id ORDER BY cl.id, ct.id")
+                mine = q("SELECT b.slot_date, b.slot_hour, cl.name, ct.name FROM bookings b "
+                         "JOIN courts ct ON ct.id = b.court_id JOIN clubs cl ON cl.id = ct.club_id "
+                         "WHERE b.member_id = %s AND b.slot_date >= current_date ORDER BY 1, 2", (m[0],))
+                return page(BOOK, courts=courts, mine=mine, hours=range(6, 22), today=datetime.date.today())
+
+            @app.route("/photo/upload-url", methods=["POST"])
+            def upload_url():
+                if "mid" not in session:
+                    abort(401)
+                key = "uploads/%d/%s" % (session["mid"], uuid.uuid4().hex)
+                # Signed form: the browser sends the (large) photo straight to S3, max 25 MB
+                return jsonify(s3.generate_presigned_post(RAW, key, ExpiresIn=300,
+                               Conditions=[["content-length-range", 1, 26214400]]))
+
+            @app.route("/photo/me")
+            def photo():
+                if "mid" not in session:
+                    abort(401)
+                key = "photos/%d.jpg" % session["mid"]
+                try:
+                    s3.head_object(Bucket=RESIZED, Key=key)
+                except Exception:
+                    abort(404)
+                return redirect(s3.generate_presigned_url("get_object", ExpiresIn=300,
+                                Params={"Bucket": RESIZED, "Key": key}))
+            PYEOF
+
+            cat > /etc/systemd/system/portal.service <<'UNIT'
+            [Unit]
+            Description=Sports Portal
+            After=network-online.target
+
+            [Service]
+            User=ec2-user
+            EnvironmentFile=/etc/portal.env
+            WorkingDirectory=/opt/portal
+            ExecStart=/usr/local/bin/gunicorn --workers 2 --threads 4 --bind 0.0.0.0:8080 app:app
+            Restart=always
+
+            [Install]
+            WantedBy=multi-user.target
+            UNIT
+
+            systemctl daemon-reload
+            systemctl enable --now portal
+
   AutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
-    DependsOn: PrivateRoute
+    DependsOn: [PrivateRoute, ALBListener]
     Properties:
       VPCZoneIdentifier:
         - !Ref PrivateSubnet1
@@ -471,7 +922,7 @@ Resources:
       HealthCheckType: ELB
       HealthCheckGracePeriod: 300
 
-  AutoScalingPolicy:
+  CPUScalingPolicy:
     Type: AWS::AutoScaling::ScalingPolicy
     Properties:
       AutoScalingGroupName: !Ref AutoScalingGroup
@@ -481,18 +932,59 @@ Resources:
           PredefinedMetricType: ASGAverageCPUUtilization
         TargetValue: 60.0
 
+  # Reacts to traffic directly, which is quicker than waiting for CPU to climb
+  RequestScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ALBRequestCountPerTarget
+          ResourceLabel: !Sub '${ApplicationLoadBalancer.LoadBalancerFullName}/${ALBTargetGroup.TargetGroupFullName}'
+        TargetValue: 300
+
+  # New servers take a few minutes to install and start the app, so reactive scaling alone
+  # is too slow for a registration rush. Pre-warm every Monday 16:30-22:00 Canberra time.
+  # (Delete these two actions, or change the Recurrence, if registration opens on other days.)
+  PreWarmScaleUp:
+    Type: AWS::AutoScaling::ScheduledAction
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      MinSize: !Ref PreWarmMinSize
+      DesiredCapacity: !Ref PreWarmMinSize
+      Recurrence: '30 16 * * 1'
+      TimeZone: Australia/Canberra
+
+  PreWarmScaleDown:
+    Type: AWS::AutoScaling::ScheduledAction
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      MinSize: 2
+      Recurrence: '0 22 * * 1'
+      TimeZone: Australia/Canberra
+
+
 #-----------------------------------------------------------------------#
-# Part Seven: CloudWatch dashboard and alarm
+# Part Seven: Monitoring and alerts (there is no IT staff to watch dashboards)
   SNSTopic:
     Type: AWS::SNS::Topic
     Properties:
       TopicName: !Sub 'sportsportal-alarm-topic-${AWS::AccountId}-${AWS::Region}'
 
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref SNSTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
   CPUAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: !Sub 'sportsportal-cpu-alarm-${AWS::AccountId}-${AWS::Region}'
-      AlarmDescription: Alarm when CPU exceeds 80% for 5 minutes
+      AlarmDescription: Web servers above 80% CPU for 5 minutes
       MetricName: CPUUtilization
       Namespace: AWS/EC2
       Statistic: Average
@@ -506,8 +998,26 @@ Resources:
       AlarmActions:
         - !Ref SNSTopic
 
-  # The ALB metric dimension must be the load balancer's "full name"
-  # (app/<name>/<id>), not its ARN, or the widget will show no data.
+  # Any message here means a photo failed to resize 3 times
+  FailedPhotosAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'sportsportal-failed-photos-alarm-${AWS::AccountId}-${AWS::Region}'
+      AlarmDescription: One or more photos could not be processed
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt PhotoProcessingDeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SNSTopic
+
   OperationDashboard:
     Type: AWS::CloudWatch::Dashboard
     Properties:
@@ -516,35 +1026,31 @@ Resources:
         {
           "widgets": [
             {
-              "type": "metric",
-              "x": 0,
-              "y": 0,
-              "width": 12,
-              "height": 6,
+              "type": "metric", "x": 0, "y": 0, "width": 12, "height": 6,
               "properties": {
-                "metrics": [
-                  [ "AWS/EC2", "CPUUtilization", "AutoScalingGroupName", "${AutoScalingGroup}" ]
-                ],
-                "period": 300,
-                "stat": "Average",
-                "region": "${AWS::Region}",
-                "title": "EC2 CPU Utilization"
+                "metrics": [ [ "AWS/EC2", "CPUUtilization", "AutoScalingGroupName", "${AutoScalingGroup}" ] ],
+                "period": 300, "stat": "Average", "region": "${AWS::Region}", "title": "Web server CPU"
               }
             },
             {
-              "type": "metric",
-              "x": 12,
-              "y": 0,
-              "width": 12,
-              "height": 6,
+              "type": "metric", "x": 12, "y": 0, "width": 12, "height": 6,
               "properties": {
-                "metrics": [
-                  [ "AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${ApplicationLoadBalancer.LoadBalancerFullName}" ]
-                ],
-                "period": 300,
-                "stat": "Sum",
-                "region": "${AWS::Region}",
-                "title": "ALB Request Count"
+                "metrics": [ [ "AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${ApplicationLoadBalancer.LoadBalancerFullName}" ] ],
+                "period": 300, "stat": "Sum", "region": "${AWS::Region}", "title": "ALB request count"
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "metrics": [ [ "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${PhotoProcessingQueue.QueueName}" ] ],
+                "period": 60, "stat": "Maximum", "region": "${AWS::Region}", "title": "Photos waiting to be resized"
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "metrics": [ [ "AWS/RDS", "DatabaseConnections", "DBInstanceIdentifier", "${DBInstance}" ] ],
+                "period": 60, "stat": "Maximum", "region": "${AWS::Region}", "title": "Database connections"
               }
             }
           ]
@@ -556,13 +1062,10 @@ Outputs:
     Value: !Sub "http://${ApplicationLoadBalancer.DNSName}"
 
   RawPhotoBucketName:
-    Description: "Name of the S3 bucket for raw photo uploads"
     Value: !Ref RawPhotoBucket
 
   ResizedPhotoBucketName:
-    Description: "Name of the S3 bucket for resized photos"
     Value: !Ref ResizedPhotoBucket
 
   SecretArn:
-    Description: "ARN of the Secrets Manager secret for RDS credentials"
     Value: !Ref DBSecret
