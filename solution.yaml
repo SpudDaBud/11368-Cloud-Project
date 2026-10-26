@@ -325,6 +325,7 @@ Resources:
       DBSubnetGroupName: !Ref DBSubnetGroup
       VPCSecurityGroups:
         - !Ref DBSecurityGroup
+      StorageEncrypted: true      # Encrypt database storage at rest (default AWS-managed key)
       MultiAZ: false              # Learner Lab does not support Multi-AZ. Turn on for real use.
       PubliclyAccessible: false
       BackupRetentionPeriod: 7    # Short-term point-in-time recovery (RDS max is 35 days)
@@ -382,6 +383,10 @@ Resources:
     DependsOn: PhotoProcessingQueuePolicy
     Properties:
       BucketName: !Sub 'sportsportal-raw-photos-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:           # Encrypt photos at rest (S3-managed keys)
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -398,7 +403,7 @@ Resources:
         Rules:
           - Id: ExpireRawPhotos
             Status: Enabled
-            ExpirationInDays: 7
+            ExpirationInDays: 30   # Raw uploads auto-delete after 30 days (matches diagram and requirements)
       NotificationConfiguration:
         QueueConfigurations:
           - Event: 's3:ObjectCreated:*'
@@ -408,6 +413,10 @@ Resources:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: !Sub 'sportsportal-resized-photos-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:           # Encrypt photos at rest (S3-managed keys)
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -915,8 +924,10 @@ Resources:
         LaunchTemplateId: !Ref LaunchTemplate
         Version: !GetAtt LaunchTemplate.LatestVersionNumber
       MinSize: 2
-      MaxSize: 6
+      MaxSize: 6                  # Diagram and report must say max 6
       DesiredCapacity: 2
+      MetricsCollection:          # Group-level metrics for the dashboard
+        - Granularity: 1Minute
       TargetGroupARNs:
         - !Ref ALBTargetGroup
       HealthCheckType: ELB
