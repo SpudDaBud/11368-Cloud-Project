@@ -1,9 +1,9 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Regional Sports Portal. 2-AZ VPC, public ALB, private Auto Scaling web tier running a
+  Regional Sports Portal. 2 availability zones, VPC, public ALB, private Auto Scaling web tier running a
   member portal (registration, renewals, court bookings, profile photos), private RDS PostgreSQL
   with 7-year AWS Backup retention, direct-to-S3 photo uploads resized asynchronously via SQS + Lambda,
-  Secrets Manager, and CloudWatch monitoring. Designed for the AWS Academy Learner Lab.
+  Secrets Manager, and CloudWatch monitoring. Designed for the AWS Academy Learner Lab and submission to the cloud architecture course.
 
 Parameters:
   VpcCidr:
