@@ -49,7 +49,7 @@ Parameters:
     Default: 400
     Description: >
       Days to keep resized profile photos. Kept just over 12 months so a member's photo does
-      not vanish before their annual renewal. Raw uploads are always deleted after 7 days.
+      not vanish before their annual renewal. Raw uploads are always deleted after 30 days.
 
   EnableResizing:
     Type: String
