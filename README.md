@@ -2,6 +2,7 @@
 
 
 11368 Group Cloud Solution Project
+Group 10
 
 This file is an AWS template file for use in the CloudFormations use in a learner lab
 
